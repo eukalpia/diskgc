@@ -1,0 +1,28 @@
+[package]
+name = "diskgc"
+description = "Smart background disk cleaner for developer machines: build artifacts, caches, orphaned containers, transparent compression"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "diskgc"
+path = "src/main.rs"
+
+[dependencies]
+diskgc-core = { path = "../diskgc-core" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,6 @@
+/target
+/ui/.dart_tool
+/ui/build
+/ui/pubspec.lock
+*.log
+.DS_Store

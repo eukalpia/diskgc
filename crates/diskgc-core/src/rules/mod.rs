@@ -1,0 +1,205 @@
+//! Rules: each one knows a single kind of garbage and turns it into explained actions.
+//! Rules never delete anything; the [`crate::executor`] does.
+
+use std::path::{Path, PathBuf};
+
+use globset::GlobSet;
+
+use crate::config::{Config, Effective};
+use crate::model::{Level, Plan};
+use crate::paths;
+
+mod ai_tools;
+mod build_dirs;
+mod caches;
+mod compress;
+mod node;
+pub mod rust;
+pub use rust::is_big_binary;
+mod scratch;
+
+/// What a rule sees while planning.
+/// Knowledge from previous runs that shapes the next plan.
+#[derive(Debug, Clone, Default)]
+pub struct PlanHints {
+    /// Command lines that freed nothing recently; skipped for now.
+    pub skip_commands: std::collections::HashSet<String>,
+}
+
+pub struct Ctx<'a> {
+    pub cfg: &'a Config,
+    pub eff: &'a Effective,
+    pub hints: PlanHints,
+    exclude: GlobSet,
+    roots: Vec<PathBuf>,
+}
+
+impl<'a> Ctx<'a> {
+    pub fn new(cfg: &'a Config, eff: &'a Effective, hints: PlanHints) -> Self {
+        let exclude = cfg.exclude_set().unwrap_or_else(|_| GlobSet::empty());
+        let roots = cfg
+            .scan
+            .roots
+            .iter()
+            .map(|r| paths::expand(r))
+            .filter(|p| p.is_dir())
+            .collect();
+        Self {
+            cfg,
+            eff,
+            hints,
+            exclude,
+            roots,
+        }
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    pub fn target_roots(&self) -> Vec<PathBuf> {
+        let mut v = self.roots.clone();
+        v.extend(
+            self.cfg
+                .scan
+                .extra_target_roots
+                .iter()
+                .map(|r| paths::expand(r))
+                .filter(|p| p.is_dir()),
+        );
+        if let Some(scratch) = crate::platform::claude_scratch_root() {
+            v.push(scratch);
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    pub fn excluded(&self, p: &Path) -> bool {
+        self.exclude.is_match(p)
+    }
+
+    /// The project a directory belongs to, for judging activity. Walks up to the topmost ancestor
+    /// that has a project marker, stopping at repository boundaries (a git worktree is its own
+    /// project) and at the scan roots.
+    pub fn project_root<'p>(&self, start: &'p Path) -> &'p Path {
+        let mut best = start;
+        let mut cur = start;
+        while let Some(parent) = cur.parent() {
+            if self.roots.iter().any(|r| r == parent) || parent.parent().is_none() {
+                break;
+            }
+            if cur.join(".git").exists() {
+                break;
+            }
+            if PROJECT_ROOT_MARKERS.iter().any(|m| parent.join(m).exists()) {
+                best = parent;
+            }
+            cur = parent;
+        }
+        best
+    }
+}
+
+/// Files whose presence next to a directory prove that it belongs to a software project.
+pub const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "pubspec.yaml",
+    "mix.exs",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "CMakeLists.txt",
+    "go.mod",
+    "Makefile",
+    "Package.swift",
+    "*.xcodeproj",
+];
+
+const PROJECT_ROOT_MARKERS: &[&str] = &[
+    "package.json",
+    "pnpm-workspace.yaml",
+    "Cargo.toml",
+    "pubspec.yaml",
+    "mix.exs",
+    "pyproject.toml",
+    "go.mod",
+];
+
+/// Directories that do not count as "the project is alive" when they change.
+pub const PROJECT_NOISE: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    ".dart_tool",
+    "build",
+    "_build",
+    ".next",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    ".gradle",
+    ".pytest_cache",
+];
+
+pub fn has_project_marker(dir: &Path) -> bool {
+    PROJECT_MARKERS.iter().any(|m| {
+        if let Some(ext) = m.strip_prefix("*.") {
+            std::fs::read_dir(dir)
+                .map(|it| {
+                    it.flatten()
+                        .any(|e| e.path().extension().map(|x| x == ext).unwrap_or(false))
+                })
+                .unwrap_or(false)
+        } else {
+            dir.join(m).exists()
+        }
+    })
+}
+
+pub trait Rule {
+    fn name(&self) -> &'static str;
+    fn plan(&self, ctx: &Ctx, plan: &mut Plan);
+}
+
+pub fn all_rules() -> Vec<Box<dyn Rule>> {
+    vec![
+        Box::new(rust::RustTargets),
+        Box::new(node::NodeModules),
+        Box::new(build_dirs::BuildDirs),
+        Box::new(scratch::Scratch),
+        Box::new(ai_tools::AiTools),
+        Box::new(caches::Caches),
+        Box::new(compress::ColdFiles),
+    ]
+}
+
+/// Run every rule and produce a plan. `on_rule` is called before each rule for progress display.
+pub fn build_plan(
+    cfg: &Config,
+    level: Level,
+    hints: PlanHints,
+    mut on_rule: impl FnMut(&str),
+) -> Plan {
+    let eff = cfg.effective(level);
+    let ctx = Ctx::new(cfg, &eff, hints);
+    let mut plan = Plan {
+        level: Some(level),
+        created_at: crate::history::now(),
+        ..Default::default()
+    };
+    for rule in all_rules() {
+        on_rule(rule.name());
+        rule.plan(&ctx, &mut plan);
+    }
+    on_rule("docker");
+    plan.docker = crate::docker::plan(cfg, &eff);
+    plan.sort_by_size();
+    plan
+}

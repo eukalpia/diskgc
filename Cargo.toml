@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/diskgc-core", "crates/diskgc"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/eukalpia/diskgc"
+authors = ["eukalpia"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+walkdir = "2"
+jwalk = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+sysinfo = "0.33"
+filetime = "0.2"
+globset = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "std"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
