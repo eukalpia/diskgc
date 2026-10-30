@@ -16,18 +16,18 @@ impl Rule for BuildDirs {
     fn plan(&self, ctx: &Ctx, plan: &mut Plan) {
         let stale = ctx.eff.build_stale_days;
         for name in &ctx.cfg.build_dirs.names {
-            for d in fs::find_dirs_named(ctx.roots(), ctx.cfg.scan.depth, name) {
+            for d in ctx.index().named(name) {
                 let Some(proj) = d.parent() else { continue };
-                if ctx.excluded(&d) || !has_project_marker(proj) {
+                if ctx.excluded(d) || !has_project_marker(proj) {
                     continue;
                 }
                 if fs::idle_for(ctx.project_root(proj), days(stale), PROJECT_NOISE) {
-                    let b = fs::disk_usage(&d);
+                    let b = fs::disk_usage(d);
                     if b > 0 {
                         plan.push(
                             Group::Build,
                             ActionKind::Remove,
-                            d,
+                            d.clone(),
                             b,
                             format!("{name}: project untouched for {stale} days"),
                         );

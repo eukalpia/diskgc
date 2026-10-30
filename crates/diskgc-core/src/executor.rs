@@ -7,50 +7,12 @@ use std::time::{Instant, SystemTime};
 use crate::config::{Config, DeleteMode};
 use crate::fs::{self, days};
 use crate::model::{Action, ActionKind, ActionResult, Plan, Progress, RunSummary};
-use crate::paths;
 use crate::platform::{self, CompressOutcome};
-use crate::rules;
+use crate::{paths, proc, rules};
 
 /// External cleanup commands must not stall a run: `uv cache clean`, for one, blocks for as long
 /// as another uv process holds the cache lock.
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// Like `Command::output`, but kills the child and returns an error after `timeout`.
-fn run_with_timeout(
-    argv: &[String],
-    timeout: std::time::Duration,
-) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
-    let mut child = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let mut stderr = Vec::new();
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_end(&mut stderr);
-            }
-            return Ok(std::process::Output {
-                status,
-                stdout: Vec::new(),
-                stderr,
-            });
-        }
-        if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("timed out after {} s", timeout.as_secs()),
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-}
 
 pub struct Executor<'a> {
     cfg: &'a Config,
@@ -70,6 +32,9 @@ impl<'a> Executor<'a> {
             allowed.push(platform::system_tmp_dir());
             allowed.push(std::env::temp_dir());
             if let Some(c) = platform::chrome_clone_dir() {
+                allowed.push(c);
+            }
+            if let Some(c) = platform::user_cache_dir() {
                 allowed.push(c);
             }
             if let Some(s) = platform::claude_scratch_root() {
@@ -134,9 +99,28 @@ impl<'a> Executor<'a> {
                     },
                     ok: true,
                     error: None,
+                    secs: 0.0,
                 }
             } else {
-                self.apply(a)
+                let t = Instant::now();
+                let outcome = self.apply(a);
+                let secs = t.elapsed().as_secs_f64();
+                match outcome {
+                    Ok(freed) => ActionResult {
+                        id: a.id,
+                        freed,
+                        ok: true,
+                        error: None,
+                        secs,
+                    },
+                    Err(e) => ActionResult {
+                        id: a.id,
+                        freed: 0,
+                        ok: false,
+                        error: Some(e),
+                        secs,
+                    },
+                }
             };
             summary.freed_bytes += result.freed;
             progress(Progress::Executed {
@@ -149,6 +133,9 @@ impl<'a> Executor<'a> {
                 let eff = self
                     .cfg
                     .effective(plan.level.unwrap_or(crate::model::Level::Normal));
+                progress(Progress::Docker {
+                    line: "docker: pruning".into(),
+                });
                 let out = crate::docker::clean(self.cfg, &eff);
                 summary.docker_freed_bytes = out.freed;
                 for l in &out.lines {
@@ -167,15 +154,10 @@ impl<'a> Executor<'a> {
         summary
     }
 
-    fn apply(&self, a: &Action) -> ActionResult {
-        let fail = |e: String| ActionResult {
-            id: a.id,
-            freed: 0,
-            ok: false,
-            error: Some(e),
-        };
+    /// Apply one action; bytes freed, measured.
+    fn apply(&self, a: &Action) -> Result<u64, String> {
         if !matches!(a.kind, ActionKind::Command { .. }) && !self.allowed(&a.path) {
-            return fail(format!(
+            return Err(format!(
                 "refused: {} is outside the allowed prefixes",
                 a.path.display()
             ));
@@ -183,78 +165,44 @@ impl<'a> Executor<'a> {
         match &a.kind {
             ActionKind::Remove => {
                 let before = fs::disk_usage(&a.path);
-                match self.remove(&a.path) {
-                    Ok(()) => ActionResult {
-                        id: a.id,
-                        freed: before,
-                        ok: true,
-                        error: None,
-                    },
-                    Err(e) => fail(e.to_string()),
-                }
+                self.remove(&a.path).map_err(|e| e.to_string())?;
+                Ok(before)
             }
             ActionKind::SweepOlderThan { days: d } => {
                 let cutoff = SystemTime::now() - days(*d);
-                let freed = fs::sweep(&a.path, |_, m| {
+                Ok(fs::sweep(&a.path, |_, m| {
                     m.modified().map(|t| t < cutoff).unwrap_or(false)
-                });
-                ActionResult {
-                    id: a.id,
-                    freed,
-                    ok: true,
-                    error: None,
-                }
+                }))
             }
-            ActionKind::SweepBigBinaries => {
-                let freed = fs::sweep(&a.path, rules::is_big_binary);
-                ActionResult {
-                    id: a.id,
-                    freed,
-                    ok: true,
-                    error: None,
-                }
-            }
+            ActionKind::SweepBigBinaries => Ok(fs::sweep(&a.path, rules::is_big_binary)),
             ActionKind::Compress => match platform::compress_file(&a.path) {
-                Ok(CompressOutcome::Compressed { before, after }) => ActionResult {
-                    id: a.id,
-                    freed: before.saturating_sub(after),
-                    ok: true,
-                    error: None,
-                },
+                Ok(CompressOutcome::Compressed { before, after }) => {
+                    Ok(before.saturating_sub(after))
+                }
                 Ok(CompressOutcome::NotWorthIt) => {
                     platform::set_nocompress_marker(&a.path);
-                    ActionResult {
-                        id: a.id,
-                        freed: 0,
-                        ok: true,
-                        error: None,
-                    }
+                    Ok(0)
                 }
                 Ok(CompressOutcome::Unsupported) => {
-                    fail("compression not supported on this platform".into())
+                    Err("compression not supported on this platform".into())
                 }
-                Err(e) => fail(e.to_string()),
+                Err(e) => Err(e.to_string()),
             },
             ActionKind::Command { argv, measure } => {
                 let before = measure.as_ref().map(|m| fs::disk_usage(m)).unwrap_or(0);
-                let out = run_with_timeout(argv, COMMAND_TIMEOUT);
-                match out {
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                match proc::output(&argv, COMMAND_TIMEOUT) {
                     Ok(o) if o.status.success() => {
                         let after = measure.as_ref().map(|m| fs::disk_usage(m)).unwrap_or(0);
-                        ActionResult {
-                            id: a.id,
-                            freed: before.saturating_sub(after),
-                            ok: true,
-                            error: None,
-                        }
+                        Ok(before.saturating_sub(after))
                     }
-                    Ok(o) => fail(format!(
+                    Ok(o) => Err(format!(
                         "{} exited with {}: {}",
                         argv[0],
                         o.status,
                         String::from_utf8_lossy(&o.stderr).trim()
                     )),
-                    Err(e) => fail(format!("{}: {e}", argv[0])),
+                    Err(e) => Err(format!("{}: {e}", argv[0])),
                 }
             }
         }

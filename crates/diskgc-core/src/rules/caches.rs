@@ -1,7 +1,9 @@
 //! Tool caches that regrow on demand: Chrome update clones, VS Code update leftovers, Go / npm /
-//! uv caches past a size cap, Homebrew downloads, Xcode DerivedData, simulator caches.
+//! uv / sccache caches past a size cap, Metal shader caches, Homebrew downloads, Xcode
+//! DerivedData, simulator caches.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use super::{Ctx, Rule};
 use crate::bytes::{from_gib, human};
@@ -9,6 +11,7 @@ use crate::fs::{self, days, hours};
 use crate::model::{ActionKind, Group, Plan};
 use crate::paths::home;
 use crate::platform::{self, which};
+use crate::proc;
 
 pub struct Caches;
 
@@ -143,6 +146,19 @@ impl Rule for Caches {
                 );
             }
         }
+        if let Some(sc) = platform::sccache_dir().filter(|d| d.is_dir()) {
+            if !ctx.excluded(&sc) {
+                plan_sccache(
+                    &sc,
+                    from_gib(c.sccache_max_gb),
+                    ctx.eff.cache_sweep_days,
+                    plan,
+                );
+            }
+        }
+        if let Some(root) = platform::user_cache_dir() {
+            plan_shader_caches(ctx, &root, from_gib(c.shader_cache_max_gb), plan);
+        }
         if which("pnpm") {
             let store = h.join(".local/share/pnpm");
             command(
@@ -231,10 +247,162 @@ impl Rule for Caches {
 }
 
 fn go_cache_dir() -> Option<PathBuf> {
-    let out = std::process::Command::new("go")
-        .args(["env", "GOCACHE"])
-        .output()
-        .ok()?;
-    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let out = proc::stdout(&["go", "env", "GOCACHE"], Duration::from_secs(15))?;
+    let p = PathBuf::from(out.trim());
     p.is_dir().then_some(p)
+}
+
+/// sccache evicts by itself only at 10 GB. Above `cap`, entries older than `sweep_days` go —
+/// all of it, in effect, when nothing compiled through it for that long.
+fn plan_sccache(dir: &Path, cap: u64, sweep_days: u64, plan: &mut Plan) {
+    let cutoff = SystemTime::now() - days(sweep_days);
+    let (mut total, mut old) = (0u64, 0u64);
+    fs::visit(dir, |_, m| {
+        let usage = platform::file_usage(m);
+        total += usage;
+        if m.is_file() && m.modified().map(|t| t < cutoff).unwrap_or(false) {
+            old += usage;
+        }
+    });
+    if total > cap && old > 0 {
+        plan.push(
+            Group::Cache,
+            ActionKind::SweepOlderThan { days: sweep_days },
+            dir.to_path_buf(),
+            old,
+            format!(
+                "sccache cache is {} (cap {}): entries unused for {sweep_days} days",
+                human(total),
+                human(cap)
+            ),
+        );
+    }
+}
+
+/// Where Metal keeps compiled shaders inside an application's folder of the system cache.
+const SHADER_DIRS: &[&str] = &[
+    "com.apple.metal",
+    "com.apple.metalfe",
+    "com.apple.gpuarchiver",
+];
+
+/// Compiled Metal shaders the system keeps per application under `root`. They grow without bound
+/// for 3D tools (Blender reached 4 GB) and are rebuilt on the next launch. Apple's own folders are
+/// left alone, and so is an application that compiled shaders within the last day.
+fn plan_shader_caches(ctx: &Ctx, root: &Path, cap: u64, plan: &mut Plan) {
+    for app in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let app = app.path();
+        let name = fs::file_name(&app);
+        if name.starts_with("com.apple.") || !app.is_dir() {
+            continue;
+        }
+        let dirs: Vec<(PathBuf, u64)> = SHADER_DIRS
+            .iter()
+            .map(|d| app.join(d))
+            .filter(|d| d.is_dir() && !ctx.excluded(d))
+            .map(|d| {
+                let b = fs::disk_usage(&d);
+                (d, b)
+            })
+            .collect();
+        let total: u64 = dirs.iter().map(|(_, b)| b).sum();
+        if total <= cap {
+            continue;
+        }
+        if !dirs.iter().all(|(d, _)| fs::idle_for(d, hours(24), &[])) {
+            plan.note(format!(
+                "kept the Metal shader cache of {name} ({}): it compiled shaders within the last day",
+                human(total)
+            ));
+            continue;
+        }
+        for (d, b) in dirs {
+            plan.push(
+                Group::Cache,
+                ActionKind::Remove,
+                d,
+                b,
+                format!(
+                    "Metal shader cache of {name} is {} (cap {}); rebuilt on the next launch",
+                    human(total),
+                    human(cap)
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::model::Level;
+    use crate::rules::PlanHints;
+
+    fn write(p: &Path, bytes: usize, age: Duration) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![b'x'; bytes]).unwrap();
+        let t = SystemTime::now() - age;
+        filetime::set_file_mtime(p, filetime::FileTime::from_system_time(t)).unwrap();
+    }
+
+    #[test]
+    fn oversized_shader_caches_of_idle_apps_go() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(
+            &root.join("org.blender/com.apple.metal/a.data"),
+            300_000,
+            days(3),
+        );
+        write(
+            &root.join("org.blender/com.apple.gpuarchiver/b"),
+            300_000,
+            days(3),
+        );
+        write(
+            &root.join("com.busy.app/com.apple.metal/a.data"),
+            600_000,
+            hours(1),
+        );
+        write(
+            &root.join("com.apple.Safari/com.apple.metal/a.data"),
+            600_000,
+            days(30),
+        );
+        write(
+            &root.join("small.app/com.apple.metal/a.data"),
+            1_000,
+            days(30),
+        );
+        let cfg = Config::default();
+        let eff = cfg.effective(Level::Normal);
+        let ctx = Ctx::new(&cfg, &eff, PlanHints::default());
+        let mut plan = Plan::default();
+        plan_shader_caches(&ctx, root, 500_000, &mut plan);
+        let mut removed: Vec<_> = plan.actions.iter().map(|a| a.path.clone()).collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                root.join("org.blender/com.apple.gpuarchiver"),
+                root.join("org.blender/com.apple.metal"),
+            ]
+        );
+        assert!(plan.notes.iter().any(|n| n.contains("com.busy.app")));
+    }
+
+    #[test]
+    fn sccache_over_cap_loses_old_entries_only() {
+        let d = tempfile::tempdir().unwrap();
+        write(&d.path().join("a/old"), 200_000, days(30));
+        write(&d.path().join("b/new"), 200_000, days(1));
+        let mut plan = Plan::default();
+        plan_sccache(d.path(), 1_000_000, 7, &mut plan);
+        assert!(plan.actions.is_empty(), "under the cap nothing happens");
+        plan_sccache(d.path(), 100_000, 7, &mut plan);
+        let a = &plan.actions[0];
+        assert!(matches!(a.kind, ActionKind::SweepOlderThan { days: 7 }));
+        assert!(a.bytes >= 200_000 && a.bytes < 400_000, "{}", a.bytes);
+    }
 }

@@ -51,32 +51,12 @@ pub fn collect(cfg: &Config, mut on_step: impl FnMut(&str)) -> Report {
     let h = home();
     let volume = paths::watched_volume();
     let (total, used, available) = platform::disk_space(&volume).unwrap_or((0, 0, 0));
-    let roots: Vec<PathBuf> = cfg
-        .scan
-        .roots
-        .iter()
-        .map(|r| paths::expand(r))
-        .filter(|p| p.is_dir())
-        .collect();
-    let mut troots = roots.clone();
-    troots.extend(
-        cfg.scan
-            .extra_target_roots
-            .iter()
-            .map(|r| paths::expand(r))
-            .filter(|p| p.is_dir()),
-    );
-    if let Some(s) = platform::claude_scratch_root() {
-        troots.push(s);
-    }
-
+    on_step("project tree");
+    let mut index = crate::rules::tree_index(cfg);
     on_step("rust targets");
-    let rust_targets = sized(fs::find_cargo_targets(&troots, cfg.scan.depth), 50);
+    let rust_targets = sized(std::mem::take(&mut index.cargo_targets), 50);
     on_step("node_modules");
-    let node_modules = sized(
-        fs::find_dirs_named(&roots, cfg.scan.depth, "node_modules"),
-        50,
-    );
+    let node_modules = sized(index.named.remove("node_modules").unwrap_or_default(), 50);
     on_step("scratch");
     let scratch_dirs: Vec<PathBuf> = platform::claude_scratch_root()
         .into_iter()
@@ -145,6 +125,20 @@ pub fn collect(cfg: &Config, mut on_step: impl FnMut(&str)) -> Report {
     }
     if let Some(x) = platform::chrome_clone_dir() {
         categories.insert("chrome_clones".into(), disk_usage(&x));
+    }
+    if let Some(sc) = platform::sccache_dir() {
+        categories.insert("sccache".into(), disk_usage(&sc));
+    }
+    if let Some(c) = platform::user_cache_dir() {
+        // Apple's own folders here belong to system processes; count the applications'.
+        let apps: u64 = std::fs::read_dir(&c)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| !fs::file_name(&e.path()).starts_with("com.apple."))
+            .map(|e| disk_usage(&e.path()))
+            .sum();
+        categories.insert("system_app_caches".into(), apps);
     }
     categories.insert(
         "toolchain_caches".into(),

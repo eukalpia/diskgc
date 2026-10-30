@@ -1,7 +1,7 @@
 //! Filesystem scanning primitives: sizes that agree with `du`, idleness checks with early exit,
 //! and lookups for well-known build directories.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -23,16 +23,16 @@ pub fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Bytes on disk under `root` for files matching `pred` (directories always count). Hard links
-/// are counted once.
-pub fn walk_bytes(root: &Path, pred: impl Fn(&Path, &std::fs::Metadata) -> bool) -> u64 {
+/// Every entry below `root` with its metadata: hard links once, symbolic links not followed,
+/// macOS-protected locations skipped. Directories are read and their entries stat'ed in parallel
+/// (jwalk + rayon); `f` runs on the calling thread. `root` itself is only reported when it is not
+/// a directory.
+pub fn visit(root: &Path, mut f: impl FnMut(&Path, &std::fs::Metadata)) {
     match std::fs::symlink_metadata(root) {
-        Ok(m) if !m.is_dir() => return platform::file_usage(&m),
-        Err(_) => return 0,
+        Ok(m) if !m.is_dir() => return f(root, &m),
+        Err(_) => return,
         _ => {}
     }
-    // Directories are read and their entries stat'ed in parallel (jwalk + rayon); the cheap
-    // part — dedupe and the predicate — runs on the consuming thread.
     let walker = jwalk::WalkDirGeneric::<((), Option<std::fs::Metadata>)>::new(root)
         .skip_hidden(false)
         .follow_links(false)
@@ -47,7 +47,6 @@ pub fn walk_bytes(root: &Path, pred: impl Fn(&Path, &std::fs::Metadata) -> bool)
             }
         });
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut total = 0u64;
     for e in walker.into_iter().filter_map(Result::ok) {
         let Some(m) = e.client_state.as_ref() else {
             continue;
@@ -57,10 +56,24 @@ pub fn walk_bytes(root: &Path, pred: impl Fn(&Path, &std::fs::Metadata) -> bool)
                 continue;
             }
         }
-        if e.file_type.is_dir() || (!e.file_type.is_symlink() && pred(&e.path(), m)) {
-            total += platform::file_usage(m);
+        f(&e.path(), m);
+    }
+}
+
+/// Bytes on disk under `root` for files matching `pred` (directories always count). Hard links
+/// are counted once.
+pub fn walk_bytes(root: &Path, pred: impl Fn(&Path, &std::fs::Metadata) -> bool) -> u64 {
+    if let Ok(m) = std::fs::symlink_metadata(root) {
+        if !m.is_dir() {
+            return platform::file_usage(&m);
         }
     }
+    let mut total = 0u64;
+    visit(root, |p, m| {
+        if m.is_dir() || (!m.file_type().is_symlink() && pred(p, m)) {
+            total += platform::file_usage(m);
+        }
+    });
     total
 }
 
@@ -110,111 +123,148 @@ pub fn idle_for(p: &Path, d: Duration, prune: &[&str]) -> bool {
 /// Directories never descended into while looking for build outputs.
 const ALWAYS_SKIP: &[&str] = &["node_modules", ".git", "Library", "AppData"];
 
-/// Directories called `name` under `roots`, at most `depth` deep. The contents of a match are not
-/// searched further (a `node_modules` inside `node_modules` is part of the outer one).
-pub fn find_dirs_named(roots: &[PathBuf], depth: usize, name: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        let mut it = WalkDir::new(root)
-            .follow_links(false)
-            .max_depth(depth)
-            .into_iter()
-            .filter_entry(|e| {
-                let n = e.file_name().to_string_lossy();
-                !(e.depth() > 0
-                    && e.file_type().is_dir()
-                    && ((ALWAYS_SKIP.contains(&n.as_ref()) && n != name)
-                        || platform::is_protected(e.path())))
-            });
-        while let Some(Ok(e)) = it.next() {
-            if e.depth() > 0 && e.file_type().is_dir() && e.file_name().to_string_lossy() == name {
-                out.push(e.path().to_path_buf());
-                it.skip_current_dir();
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
+/// What one walk over the project roots finds: Cargo build directories and directories with one
+/// of the wanted names.
+#[derive(Debug, Default)]
+pub struct TreeIndex {
+    pub cargo_targets: Vec<PathBuf>,
+    pub named: BTreeMap<String, Vec<PathBuf>>,
 }
 
-/// Cargo build directories: any directory holding `.rustc_info.json` or a cargo `CACHEDIR.TAG`.
-/// Matching by content rather than by the name `target` also finds the ad-hoc
-/// `CARGO_TARGET_DIR`s that tools and agents create in temp folders.
-pub fn find_cargo_targets(roots: &[PathBuf], depth: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+impl TreeIndex {
+    pub fn named(&self, name: &str) -> &[PathBuf] {
+        self.named.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Walk `roots` once, at most `depth` deep, collecting Cargo build directories and directories
+/// called one of `names`. Searching once per rule and per name used to mean a dozen passes over
+/// every project tree.
+///
+/// A Cargo build directory is any directory holding `.rustc_info.json` or a cargo `CACHEDIR.TAG`:
+/// matching by content rather than by the name `target` also finds the ad-hoc `CARGO_TARGET_DIR`s
+/// that tools and agents create in temp folders. It is never descended into — its hundreds of
+/// thousands of files are the rust rule's business. A named directory is not descended into when
+/// `is_leaf(name, dir)` says its contents belong to it (a `node_modules` inside `node_modules` is
+/// part of the outer one).
+pub fn index_tree(
+    roots: &[PathBuf],
+    depth: usize,
+    names: &[&str],
+    is_leaf: impl Fn(&str, &Path) -> bool,
+) -> TreeIndex {
+    let mut idx = TreeIndex::default();
     for root in roots {
         if !root.is_dir() {
             continue;
         }
+        // Sorted, so the marker files of a build directory come before its subdirectories and
+        // skipping the rest of the directory skips all of it.
         let mut it = WalkDir::new(root)
             .follow_links(false)
             .max_depth(depth)
             .sort_by_file_name()
-            .into_iter()
-            .filter_entry(|e| {
-                let n = e.file_name().to_string_lossy();
-                !(e.depth() > 0
-                    && e.file_type().is_dir()
-                    && (ALWAYS_SKIP.contains(&n.as_ref()) || platform::is_protected(e.path())))
-            });
+            .into_iter();
         while let Some(Ok(e)) = it.next() {
+            if e.depth() == 0 {
+                continue;
+            }
+            let n = e.file_name().to_string_lossy();
+            if e.file_type().is_dir() {
+                if platform::is_protected(e.path()) {
+                    it.skip_current_dir();
+                } else if let Some(name) = names.iter().find(|w| **w == n) {
+                    idx.named
+                        .entry(name.to_string())
+                        .or_default()
+                        .push(e.path().to_path_buf());
+                    if is_leaf(name, e.path()) {
+                        it.skip_current_dir();
+                    }
+                } else if ALWAYS_SKIP.contains(&n.as_ref()) {
+                    it.skip_current_dir();
+                }
+                continue;
+            }
             if !e.file_type().is_file() {
                 continue;
             }
-            let is_cargo = match e.file_name().to_str() {
-                Some(".rustc_info.json") => true,
-                Some("CACHEDIR.TAG") => std::fs::read_to_string(e.path())
+            let is_cargo = match n.as_ref() {
+                ".rustc_info.json" => true,
+                "CACHEDIR.TAG" => std::fs::read_to_string(e.path())
                     .map(|t| t.to_lowercase().contains("cargo"))
                     .unwrap_or(false),
                 _ => false,
             };
             if is_cargo {
                 if let Some(parent) = e.path().parent() {
-                    out.push(parent.to_path_buf());
+                    idx.cargo_targets.push(parent.to_path_buf());
                 }
                 it.skip_current_dir();
             }
         }
     }
-    out.sort();
-    out.dedup();
-    out
+    idx.cargo_targets.sort();
+    idx.cargo_targets.dedup();
+    for v in idx.named.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    idx
 }
 
-/// Delete files matching `pred` under `root`, then remove directories left empty.
-/// Returns bytes freed, measured (not estimated).
+/// Directories called `name` under `roots`, at most `depth` deep, not searched further once found.
+pub fn find_dirs_named(roots: &[PathBuf], depth: usize, name: &str) -> Vec<PathBuf> {
+    let mut idx = index_tree(roots, depth, &[name], |_, _| true);
+    idx.named.remove(name).unwrap_or_default()
+}
+
+/// Cargo build directories under `roots` (see [`index_tree`]).
+pub fn find_cargo_targets(roots: &[PathBuf], depth: usize) -> Vec<PathBuf> {
+    index_tree(roots, depth, &[], |_, _| true).cargo_targets
+}
+
+/// Delete files matching `pred` under `root`, then remove directories left empty. Returns the bytes
+/// freed: the blocks of every deleted file that was its last link, plus the emptied directories.
+/// One pass; it used to measure the whole tree before and after, three walks more.
 pub fn sweep(root: &Path, pred: impl Fn(&Path, &std::fs::Metadata) -> bool) -> u64 {
-    let before = disk_usage(root);
+    let mut freed = 0u64;
+    let mut dirs: Vec<(PathBuf, u64)> = Vec::new();
     for e in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
     {
+        if e.file_type().is_dir() {
+            if e.depth() > 0 {
+                let usage = e.metadata().map(|m| platform::file_usage(&m)).unwrap_or(0);
+                dirs.push((e.path().to_path_buf(), usage));
+            }
+            continue;
+        }
         if !e.file_type().is_file() {
             continue;
         }
-        if let Ok(m) = e.metadata() {
-            if pred(e.path(), &m) {
-                let _ = std::fs::remove_file(e.path());
-            }
+        // Fresh metadata: a hard link whose twin went earlier in this sweep is now the last
+        // link, and deleting it really frees the blocks.
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if pred(e.path(), &m)
+            && std::fs::remove_file(e.path()).is_ok()
+            && platform::hardlink_key(&m).is_none()
+        {
+            freed += platform::file_usage(&m);
         }
     }
-    let mut dirs: Vec<PathBuf> = WalkDir::new(root)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_dir())
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    for d in dirs {
-        let _ = std::fs::remove_dir(&d); // fails harmlessly when not empty
+    dirs.sort_by_key(|(d, _)| std::cmp::Reverse(d.components().count()));
+    for (d, usage) in dirs {
+        // Fails harmlessly when the directory is not empty.
+        if std::fs::remove_dir(&d).is_ok() {
+            freed += usage;
+        }
     }
-    before.saturating_sub(disk_usage(root))
+    freed
 }
 
 #[cfg(test)]

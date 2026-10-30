@@ -112,6 +112,10 @@ pub fn chrome_clone_dir() -> Option<PathBuf> {
     None
 }
 
+pub fn user_cache_dir() -> Option<PathBuf> {
+    None
+}
+
 pub fn notify(title: &str, body: &str) {
     let script = format!(
         "[reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null; $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; $n.ShowBalloonTip(5000, '{}', '{}', 'Info')",

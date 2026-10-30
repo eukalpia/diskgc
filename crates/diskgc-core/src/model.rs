@@ -136,6 +136,15 @@ pub struct Plan {
     /// Things deliberately left alone, with the reason.
     pub notes: Vec<String>,
     pub docker: Option<DockerPlan>,
+    /// How long each rule took to plan, in order. Slow scans show up here first.
+    #[serde(default)]
+    pub timings: Vec<RuleTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleTiming {
+    pub rule: String,
+    pub secs: f64,
 }
 
 impl Plan {
@@ -191,6 +200,9 @@ pub struct ActionResult {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Wall-clock time the action took.
+    #[serde(default)]
+    pub secs: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

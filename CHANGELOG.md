@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.3.0 — unreleased
+
+Found on a machine where agents kept a dozen git worktrees, each with its own `target/`.
+
+- Rust targets have a budget for all of them together (`[rust] total_max_gb`, 40 GB): above it,
+  whole targets go, least recently built first, once idle. Eleven targets of 3–19 GB had stayed
+  under the per-directory cap while taking 62 GB between them.
+- The target of a linked worktree whose branch is merged into `main`/`master` goes once idle
+  (`[rust] merged_idle_hours`); the plan suggests `git worktree remove` for the rest.
+- New caches: sccache over `[caches] sccache_max_gb` loses entries unused for a week; Metal shader
+  caches per application on macOS (`shader_cache_max_gb`) — Blender's had reached 4 GB.
+- Docker build cache is really pruned: `docker builder prune` now runs with `-a` (without it only
+  dangling records went, and 7 GB survived every run); the window shrinks with the level.
+- Planning walks the project roots once instead of once per rule and per build-directory name
+  (fourteen walks with the default names), and no longer descends into Cargo targets. Each target
+  is read once instead of four or five times; a sweep is one pass instead of four. A dry run on
+  the machine above went from 7–9 s to 1.2 s.
+- Every external command has a deadline, `docker` and `go` included; output after the command
+  exits is awaited for 5 s at most, so a background helper holding the pipe cannot hang a run.
+- The daemon logs how long planning took and which rules were slow, names actions over 30 s, and
+  a watchdog reports any step still running after 5 minutes. A run that stalled for hours used to
+  leave nothing in the log. `clean -n` prints the planning time.
+- `report` gains `sccache` and `system_app_caches` categories.
+
+## 0.2.0
 
 First version structured for other people's machines.
 

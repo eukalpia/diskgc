@@ -101,8 +101,13 @@ pub fn plan(p: &Plan, as_json: bool) {
         if !d.available {
             println!("  daemon not running, skipped");
         } else {
-            println!("  {} orphaned testcontainers; stopped > {} h; build cache > {} d; images {}; reclaimable ~{}",
-                d.orphan_testcontainers, d.stopped_hours, d.build_cache_days, if d.image_prune_all { "all unused" } else { "dangling" }, human(d.reclaimable_bytes));
+            let build_cache = if d.build_cache_days == 0 {
+                "all unused".to_string()
+            } else {
+                format!("> {} d", d.build_cache_days)
+            };
+            println!("  {} orphaned testcontainers; stopped > {} h; build cache {}; images {}; reclaimable ~{}",
+                d.orphan_testcontainers, d.stopped_hours, build_cache, if d.image_prune_all { "all unused" } else { "dangling" }, human(d.reclaimable_bytes));
         }
     }
     for n in &p.notes {
@@ -113,6 +118,23 @@ pub fn plan(p: &Plan, as_json: bool) {
         human(p.estimated_bytes()),
         p.actions.len()
     );
+    if !p.timings.is_empty() {
+        let total: f64 = p.timings.iter().map(|t| t.secs).sum();
+        let mut slow: Vec<_> = p.timings.iter().filter(|t| t.secs >= 0.1).collect();
+        slow.sort_by(|a, b| b.secs.total_cmp(&a.secs));
+        let detail: Vec<String> = slow
+            .iter()
+            .map(|t| format!("{} {:.1} s", t.rule, t.secs))
+            .collect();
+        println!(
+            "Planned in {total:.1} s{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", detail.join(", "))
+            }
+        );
+    }
 }
 
 pub fn run(p: &Plan, s: &RunSummary, as_json: bool) {

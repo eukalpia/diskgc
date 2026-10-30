@@ -12,6 +12,70 @@ use crate::protocol::Event;
 
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// What a run is doing right now and since when; `None` between runs.
+type Phase = Arc<Mutex<Option<(String, Instant)>>>;
+
+/// A step running longer than this is reported, and again every `WATCHDOG_REPEAT`.
+const WATCHDOG_AFTER: Duration = Duration::from_secs(5 * 60);
+const WATCHDOG_REPEAT: Duration = Duration::from_secs(15 * 60);
+/// Actions slower than this are named in the log after the run.
+const SLOW_ACTION_SECS: f64 = 30.0;
+
+fn emit(events: &EventSink, level: &str, message: String) {
+    match level {
+        "warn" => tracing::warn!("{message}"),
+        _ => tracing::info!("{message}"),
+    }
+    events(Event::Log {
+        level: level.into(),
+        message,
+    });
+}
+
+fn set_phase(phase: &Phase, what: Option<String>) {
+    *phase.lock().unwrap() = what.map(|w| (w, Instant::now()));
+}
+
+/// Logs a step that has been running for minutes, so a stuck run names its culprit instead of
+/// going quiet until the next restart.
+fn spawn_watchdog(phase: Phase, stop: Arc<AtomicBool>, events: EventSink) {
+    std::thread::spawn(move || {
+        let mut reported: Option<(String, Instant)> = None;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(5));
+            let Some((what, since)) = phase.lock().unwrap().clone() else {
+                continue;
+            };
+            let elapsed = since.elapsed();
+            if elapsed < WATCHDOG_AFTER {
+                continue;
+            }
+            let due = match &reported {
+                Some((w, at)) if *w == what => at.elapsed() >= WATCHDOG_REPEAT,
+                _ => true,
+            };
+            if due {
+                emit(
+                    &events,
+                    "warn",
+                    format!("still busy after {} min: {what}", elapsed.as_secs() / 60),
+                );
+                reported = Some((what, Instant::now()));
+            }
+        }
+    });
+}
+
+fn secs(d: f64) -> String {
+    if d < 10.0 {
+        format!("{d:.1} s")
+    } else if d < 120.0 {
+        format!("{d:.0} s")
+    } else {
+        format!("{:.1} min", d / 60.0)
+    }
+}
+
 pub struct Daemon {
     pub engine: Arc<RwLock<Engine>>,
     /// Held while any run (plan, execute, clean, report) is in progress, by the loop or by IPC clients.
@@ -24,18 +88,13 @@ pub struct Daemon {
 
 impl Daemon {
     fn log(&self, level: &str, message: String) {
-        match level {
-            "warn" => tracing::warn!("{message}"),
-            _ => tracing::info!("{message}"),
-        }
-        (self.events)(Event::Log {
-            level: level.into(),
-            message,
-        });
+        emit(&self.events, level, message)
     }
 
     pub fn run(&self) {
         self.log("info", "daemon started".into());
+        let phase: Phase = Arc::new(Mutex::new(None));
+        spawn_watchdog(phase.clone(), self.stop.clone(), self.events.clone());
         let mut last_clean: Option<Instant> = None;
         let mut last_level = Level::Normal;
         let mut first = true;
@@ -105,18 +164,79 @@ impl Daemon {
                         ),
                     );
                     let events = self.events.clone();
-                    let (_, summary) = eng.clean(level, false, |p| {
-                        if let Progress::Finished { .. } = &p {
-                            return;
+                    let mut forward = |p: Progress| {
+                        match &p {
+                            Progress::Scanning { rule } => {
+                                set_phase(&phase, Some(format!("planning: {rule}")))
+                            }
+                            Progress::Executing {
+                                index,
+                                total,
+                                action,
+                            } => set_phase(
+                                &phase,
+                                Some(format!(
+                                    "action {index}/{total}: {} {}",
+                                    action.kind.verb(),
+                                    action.path.display()
+                                )),
+                            ),
+                            Progress::Docker { line } if line == "docker: pruning" => {
+                                set_phase(&phase, Some("docker prune".into()))
+                            }
+                            Progress::Finished { .. } => return,
+                            _ => {}
                         }
                         events(Event::Progress(p));
-                    });
+                    };
+                    let started = Instant::now();
+                    let plan = eng.plan(level, &mut forward);
+                    let slow_rules: Vec<String> = plan
+                        .timings
+                        .iter()
+                        .filter(|t| t.secs >= 1.0)
+                        .map(|t| format!("{} {}", t.rule, secs(t.secs)))
+                        .collect();
+                    self.log(
+                        "info",
+                        format!(
+                            "planned {} actions (~{}) in {}{}",
+                            plan.actions.len(),
+                            human(plan.estimated_bytes()),
+                            secs(started.elapsed().as_secs_f64()),
+                            if slow_rules.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", slow_rules.join(", "))
+                            }
+                        ),
+                    );
+                    let summary = eng.execute(&plan, None, false, &mut forward);
+                    set_phase(&phase, None);
                     (self.events)(Event::RunFinished(summary.clone()));
+                    for r in summary
+                        .results
+                        .iter()
+                        .filter(|r| r.secs >= SLOW_ACTION_SECS)
+                    {
+                        if let Some(a) = plan.actions.iter().find(|a| a.id == r.id) {
+                            self.log(
+                                "info",
+                                format!(
+                                    "slow action: {} {} took {}",
+                                    a.kind.verb(),
+                                    a.path.display(),
+                                    secs(r.secs)
+                                ),
+                            );
+                        }
+                    }
                     let freed = summary.freed_bytes + summary.docker_freed_bytes;
                     self.log(
                         "info",
                         format!(
-                            "run finished: {} freed, {} actions, {} free now",
+                            "run finished in {}: {} freed, {} actions, {} free now",
+                            secs(started.elapsed().as_secs_f64()),
                             human(freed),
                             summary.action_count,
                             human(summary.free_after)
@@ -134,7 +254,8 @@ impl Daemon {
                             ),
                         );
                     }
-                    let _ = eng.report(|_| {});
+                    let _ = eng.report(|step| set_phase(&phase, Some(format!("report: {step}"))));
+                    set_phase(&phase, None);
                     last_clean = Some(Instant::now());
                     last_level = level;
                 }

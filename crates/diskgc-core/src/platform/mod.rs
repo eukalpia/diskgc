@@ -98,6 +98,27 @@ pub fn chrome_clone_dir() -> Option<PathBuf> {
     os::chrome_clone_dir()
 }
 
+/// The per-user cache directory the system itself manages (`/var/folders/…/C` on macOS), where
+/// Metal keeps compiled shaders per application. `None` elsewhere.
+pub fn user_cache_dir() -> Option<PathBuf> {
+    os::user_cache_dir()
+}
+
+/// sccache's local disk cache: `$SCCACHE_DIR`, else the platform default it uses itself.
+pub fn sccache_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("SCCACHE_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    let base = dirs::cache_dir()?;
+    Some(if cfg!(target_os = "macos") {
+        base.join("Mozilla.sccache")
+    } else if cfg!(windows) {
+        base.join("Mozilla").join("sccache").join("cache")
+    } else {
+        base.join("sccache")
+    })
+}
+
 pub fn notify(title: &str, body: &str) {
     os::notify(title, body)
 }

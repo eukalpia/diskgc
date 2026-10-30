@@ -1,13 +1,16 @@
 //! Rules: each one knows a single kind of garbage and turns it into explained actions.
 //! Rules never delete anything; the [`crate::executor`] does.
 
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use globset::GlobSet;
 
 use crate::config::{Config, Effective};
-use crate::model::{Level, Plan};
-use crate::paths;
+use crate::fs::TreeIndex;
+use crate::model::{Level, Plan, RuleTiming};
+use crate::{fs, paths};
 
 mod ai_tools;
 mod build_dirs;
@@ -32,6 +35,7 @@ pub struct Ctx<'a> {
     pub hints: PlanHints,
     exclude: GlobSet,
     roots: Vec<PathBuf>,
+    index: OnceCell<TreeIndex>,
 }
 
 impl<'a> Ctx<'a> {
@@ -50,7 +54,31 @@ impl<'a> Ctx<'a> {
             hints,
             exclude,
             roots,
+            index: OnceCell::new(),
         }
+    }
+
+    /// Cargo targets, `node_modules` and build directories, found in one walk on first use.
+    pub fn index(&self) -> &TreeIndex {
+        self.index.get_or_init(|| {
+            let mut names = vec!["node_modules"];
+            names.extend(self.cfg.build_dirs.names.iter().map(String::as_str));
+            let mut idx = fs::index_tree(
+                &self.target_roots(),
+                self.cfg.scan.depth,
+                &names,
+                |name, dir| {
+                    // A build directory belongs to its project only when a project marker sits
+                    // next to it; a user folder that happens to be called `build` is searched on.
+                    name == "node_modules" || dir.parent().map(has_project_marker).unwrap_or(false)
+                },
+            );
+            // The extra target roots (temp folders) are searched for Cargo output alone.
+            for dirs in idx.named.values_mut() {
+                dirs.retain(|d| self.roots.iter().any(|r| d.starts_with(r)));
+            }
+            idx
+        })
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -180,6 +208,14 @@ pub fn all_rules() -> Vec<Box<dyn Rule>> {
     ]
 }
 
+/// The project-tree walk the rules share, for callers outside a plan (the report).
+pub fn tree_index(cfg: &Config) -> TreeIndex {
+    let eff = cfg.effective(Level::Normal);
+    let ctx = Ctx::new(cfg, &eff, PlanHints::default());
+    ctx.index();
+    ctx.index.into_inner().unwrap_or_default()
+}
+
 /// Run every rule and produce a plan. `on_rule` is called before each rule for progress display.
 pub fn build_plan(
     cfg: &Config,
@@ -194,12 +230,26 @@ pub fn build_plan(
         created_at: crate::history::now(),
         ..Default::default()
     };
+    let timed = |plan: &mut Plan, name: &str, t: Instant| {
+        plan.timings.push(RuleTiming {
+            rule: name.to_string(),
+            secs: t.elapsed().as_secs_f64(),
+        })
+    };
+    on_rule("project tree");
+    let t = Instant::now();
+    ctx.index();
+    timed(&mut plan, "project tree", t);
     for rule in all_rules() {
         on_rule(rule.name());
+        let t = Instant::now();
         rule.plan(&ctx, &mut plan);
+        timed(&mut plan, rule.name(), t);
     }
     on_rule("docker");
+    let t = Instant::now();
     plan.docker = crate::docker::plan(cfg, &eff);
+    timed(&mut plan, "docker", t);
     plan.sort_by_size();
     plan
 }

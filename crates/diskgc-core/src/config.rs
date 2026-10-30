@@ -89,6 +89,13 @@ pub struct Rust {
     /// directory is idle for `idle_hours`, remove it entirely.
     pub target_max_gb: f64,
     pub idle_hours: u64,
+    /// Budget for all `target/` directories together. Above it, whole targets go in least
+    /// recently built order once idle for `idle_hours`: a dozen agent worktrees of 5–20 GB each
+    /// never trip the per-directory cap, yet add up to more than the disk can spare.
+    pub total_max_gb: f64,
+    /// The target of a linked git worktree whose branch is already merged into the main branch
+    /// goes once nothing was built there for this long.
+    pub merged_idle_hours: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +152,12 @@ pub struct Caches {
     pub go_cache_max_gb: f64,
     pub npm_cache_max_gb: f64,
     pub uv_cache_max_gb: f64,
+    /// sccache's local cache above this size loses entries older than a week; all of it when
+    /// nothing used it for a week. sccache itself only caps it at 10 GB.
+    pub sccache_max_gb: f64,
+    /// Metal shader caches the system keeps per application (macOS): above this size for one
+    /// application, and when it compiled nothing for a day, they go and are rebuilt on demand.
+    pub shader_cache_max_gb: f64,
     pub brew_prune_days: u64,
     pub xcode_derived_days: u64,
     pub vscode_shipit: bool,
@@ -229,6 +242,8 @@ impl Default for Rust {
             sweep_days: 7,
             target_max_gb: 20.0,
             idle_hours: 12,
+            total_max_gb: 40.0,
+            merged_idle_hours: 6,
         }
     }
 }
@@ -295,6 +310,8 @@ impl Default for Caches {
             go_cache_max_gb: 2.0,
             npm_cache_max_gb: 1.0,
             uv_cache_max_gb: 1.0,
+            sccache_max_gb: 2.0,
+            shader_cache_max_gb: 1.0,
             brew_prune_days: 7,
             xcode_derived_days: 14,
             vscode_shipit: true,
@@ -330,12 +347,18 @@ pub struct Effective {
     pub rust_sweep_days: u64,
     pub rust_target_max_gb: f64,
     pub rust_idle_hours: u64,
+    pub rust_total_max_gb: f64,
+    pub rust_merged_idle_hours: u64,
     pub node_stale_days: u64,
     pub build_stale_days: u64,
     pub claude_scratch_days: u64,
     pub tmp_stale_days: u64,
     pub docker_stopped_hours: u64,
     pub testcontainers_hours: u64,
+    /// Build cache unused for this long is pruned; `0` = all unused build cache.
+    pub docker_build_cache_hours: u64,
+    /// Age after which entries of size-capped tool caches (sccache) are dropped.
+    pub cache_sweep_days: u64,
 }
 
 fn shrink(v: u64, div: u64) -> u64 {
@@ -410,12 +433,24 @@ impl Config {
                 self.rust.target_max_gb
             },
             rust_idle_hours: shrink(self.rust.idle_hours, div),
+            rust_total_max_gb: if level == Level::Critical {
+                self.rust.total_max_gb / 2.0
+            } else {
+                self.rust.total_max_gb
+            },
+            rust_merged_idle_hours: shrink(self.rust.merged_idle_hours, div),
             node_stale_days: shrink(self.node.stale_days, div),
             build_stale_days: shrink(self.build_dirs.stale_days, div),
             claude_scratch_days: shrink(self.scratch.claude_stale_days, div),
             tmp_stale_days: shrink(self.scratch.tmp_stale_days, div),
             docker_stopped_hours: shrink(self.docker.stopped_hours, div),
             testcontainers_hours: shrink(self.docker.testcontainers_max_hours, div),
+            docker_build_cache_hours: if level == Level::Critical {
+                0
+            } else {
+                shrink(self.docker.build_cache_days * 24, div)
+            },
+            cache_sweep_days: shrink(7, div),
         }
     }
 
@@ -476,6 +511,18 @@ mod tests {
         assert_eq!(cfg.effective(Level::Low).node_stale_days, 15);
         assert_eq!(cfg.effective(Level::Critical).node_stale_days, 7);
         assert_eq!(cfg.effective(Level::Critical).rust_target_max_gb, 10.0);
+        assert_eq!(cfg.effective(Level::Critical).rust_total_max_gb, 20.0);
+        assert_eq!(cfg.effective(Level::Normal).docker_build_cache_hours, 168);
+        assert_eq!(cfg.effective(Level::Low).docker_build_cache_hours, 84);
+        assert_eq!(cfg.effective(Level::Critical).docker_build_cache_hours, 0);
+    }
+
+    #[test]
+    fn config_without_new_keys_still_loads() {
+        let cfg =
+            Config::parse("[rust]\nsweep_days = 3\n[caches]\ngo_cache_max_gb = 1.0\n").unwrap();
+        assert_eq!(cfg.rust.total_max_gb, 40.0);
+        assert_eq!(cfg.caches.sccache_max_gb, 2.0);
     }
 
     #[test]

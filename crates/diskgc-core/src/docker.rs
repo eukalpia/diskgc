@@ -1,21 +1,39 @@
 //! Docker (Docker Desktop, OrbStack, Colima, Podman with the docker CLI): orphaned
 //! testcontainers, stopped containers, dangling volumes, build cache, dangling images.
 
-use std::process::Command;
+use std::time::Duration;
 
 use crate::bytes::parse_human;
 use crate::config::{Config, Effective};
 use crate::model::DockerPlan;
+use crate::proc;
+
+/// Queries answer in well under a second from a healthy daemon. Without a deadline, a VM that is
+/// starting, stuck or asleep holds the whole run hostage.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// A prune walks the VM's disk and can legitimately take minutes.
+const PRUNE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+fn run_for(args: &[&str], timeout: Duration) -> Option<String> {
+    let mut argv = vec!["docker"];
+    argv.extend_from_slice(args);
+    let out = proc::stdout(&argv, timeout);
+    if out.is_none() {
+        tracing::debug!("docker {} failed or timed out", args.join(" "));
+    }
+    out
+}
 
 fn run(args: &[&str]) -> Option<String> {
-    let out = Command::new("docker").args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    run_for(args, QUERY_TIMEOUT)
 }
 
 pub fn available() -> bool {
-    run(&["info", "--format", "{{.ServerVersion}}"]).is_some()
+    run_for(
+        &["info", "--format", "{{.ServerVersion}}"],
+        Duration::from_secs(15),
+    )
+    .is_some()
 }
 
 /// Sum of the `Size` column of `docker system df`, in bytes (approximate).
@@ -82,7 +100,7 @@ pub fn plan(cfg: &Config, eff: &Effective) -> Option<DockerPlan> {
             available: false,
             orphan_testcontainers: 0,
             stopped_hours: eff.docker_stopped_hours,
-            build_cache_days: cfg.docker.build_cache_days,
+            build_cache_days: eff.docker_build_cache_hours / 24,
             image_prune_all: cfg.docker.image_prune_all,
             reclaimable_bytes: 0,
         });
@@ -91,7 +109,7 @@ pub fn plan(cfg: &Config, eff: &Effective) -> Option<DockerPlan> {
         available: true,
         orphan_testcontainers: orphan_testcontainers(eff.testcontainers_hours).len(),
         stopped_hours: eff.docker_stopped_hours,
-        build_cache_days: cfg.docker.build_cache_days,
+        build_cache_days: eff.docker_build_cache_hours / 24,
         image_prune_all: cfg.docker.image_prune_all,
         reclaimable_bytes: reclaimable_bytes(),
     })
@@ -123,25 +141,35 @@ pub fn clean(cfg: &Config, eff: &Effective) -> DockerOutcome {
             eff.testcontainers_hours
         ));
     }
-    run(&[
-        "container",
-        "prune",
-        "-f",
-        "--filter",
-        &format!("until={}h", eff.docker_stopped_hours),
-    ]);
-    run(&["volume", "prune", "-f"]);
-    run(&[
-        "builder",
-        "prune",
-        "-f",
-        "--filter",
-        &format!("until={}h", cfg.docker.build_cache_days * 24),
-    ]);
+    let prune = |args: &[&str], what: &str, lines: &mut Vec<String>| {
+        if run_for(args, PRUNE_TIMEOUT).is_none() {
+            lines.push(format!("docker: {what} failed or timed out"));
+        }
+    };
+    prune(
+        &[
+            "container",
+            "prune",
+            "-f",
+            "--filter",
+            &format!("until={}h", eff.docker_stopped_hours),
+        ],
+        "container prune",
+        &mut lines,
+    );
+    prune(&["volume", "prune", "-f"], "volume prune", &mut lines);
+    // `-a`: without it only dangling records go, and BuildKit's cache is almost never dangling —
+    // 7 GB of it used to survive every run.
+    let until = format!("until={}h", eff.docker_build_cache_hours);
+    let mut builder = vec!["builder", "prune", "-af"];
+    if eff.docker_build_cache_hours > 0 {
+        builder.extend(["--filter", until.as_str()]);
+    }
+    prune(&builder, "builder prune", &mut lines);
     if cfg.docker.image_prune_all {
-        run(&["image", "prune", "-af"]);
+        prune(&["image", "prune", "-af"], "image prune", &mut lines);
     } else {
-        run(&["image", "prune", "-f"]);
+        prune(&["image", "prune", "-f"], "image prune", &mut lines);
     }
     let after = total_bytes();
     lines.push(format!(

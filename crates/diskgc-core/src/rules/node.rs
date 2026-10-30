@@ -13,19 +13,19 @@ impl Rule for NodeModules {
 
     fn plan(&self, ctx: &Ctx, plan: &mut Plan) {
         let stale = ctx.eff.node_stale_days;
-        for nm in fs::find_dirs_named(ctx.roots(), ctx.cfg.scan.depth, "node_modules") {
+        for nm in ctx.index().named("node_modules") {
             let Some(proj) = nm.parent() else { continue };
-            if ctx.excluded(&nm) || !proj.join("package.json").exists() {
+            if ctx.excluded(nm) || !proj.join("package.json").exists() {
                 continue;
             }
             let root = ctx.project_root(proj);
             if fs::idle_for(root, days(stale), PROJECT_NOISE) {
-                let b = fs::disk_usage(&nm);
+                let b = fs::disk_usage(nm);
                 if b > 0 {
                     plan.push(
                         Group::Node,
                         ActionKind::Remove,
-                        nm,
+                        nm.clone(),
                         b,
                         format!("project untouched for {stale} days; restored by install"),
                     );

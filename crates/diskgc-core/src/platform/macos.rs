@@ -86,16 +86,23 @@ pub fn claude_scratch_root() -> Option<PathBuf> {
     unix::claude_scratch_root(&system_tmp_dir())
 }
 
-/// `$TMPDIR` is `/var/folders/xx/yyyy/T`; the sibling `X` holds Chrome's code-signing clones.
-pub fn chrome_clone_dir() -> Option<PathBuf> {
+/// `$TMPDIR` is `/var/folders/xx/yyyy/T`; its siblings are the other per-user system folders.
+fn darwin_user_dir(name: &str) -> Option<PathBuf> {
     let t = std::env::var_os("TMPDIR")?;
     let t = PathBuf::from(t);
     let t = t.to_string_lossy().trim_end_matches('/').to_string();
-    let x = Path::new(&t)
-        .parent()?
-        .join("X")
-        .join("com.google.Chrome.code_sign_clone");
+    Some(Path::new(&t).parent()?.join(name))
+}
+
+/// The sibling `X` holds Chrome's code-signing clones.
+pub fn chrome_clone_dir() -> Option<PathBuf> {
+    let x = darwin_user_dir("X")?.join("com.google.Chrome.code_sign_clone");
     x.is_dir().then_some(x)
+}
+
+/// The sibling `C` (`DARWIN_USER_CACHE_DIR`).
+pub fn user_cache_dir() -> Option<PathBuf> {
+    darwin_user_dir("C").filter(|c| c.is_dir())
 }
 
 pub fn notify(title: &str, body: &str) {

@@ -49,6 +49,8 @@ Must satisfy `critical_gb <= low_gb <= comfortable_gb`.
 | `sweep_days` | `7` — artifacts untouched this long are deleted |
 | `target_max_gb` | `20` — above this incremental caches and fat test binaries go; if still above and idle for `idle_hours`, the whole directory |
 | `idle_hours` | `12` |
+| `total_max_gb` | `40` — budget for all targets together. Above it, whole targets go, least recently built first, once idle for `idle_hours`. A dozen agent worktrees of 5–20 GB each never trip `target_max_gb`, yet add up to more than the disk can spare. Halved at the critical level. |
+| `merged_idle_hours` | `6` — the target of a linked git worktree whose branch is already merged into `main` (or `master`) goes once nothing was built there for this long. The worktree itself is left alone; the plan notes that `git worktree remove` would free its sources too. |
 
 Above `2 × target_max_gb` everything older than a day is swept even while a
 build is running, so a permanently building agent cannot grow a target without
@@ -93,7 +95,7 @@ A directory is a candidate only when a project marker (`Cargo.toml`,
 | `enable` | `true` |
 | `testcontainers_max_hours` | `2` — containers labelled by testcontainers older than this are orphans |
 | `stopped_hours` | `24` |
-| `build_cache_days` | `7` |
+| `build_cache_days` | `7` — BuildKit cache unused this long is pruned (`docker builder prune -a`); halved at the low level, all unused cache at the critical level |
 | `image_prune_all` | `false` — `true` also removes images not used by any container |
 
 ## `[caches]`
@@ -104,6 +106,8 @@ A directory is a candidate only when a project marker (`Cargo.toml`,
 | `go_cache_max_gb` | `2` |
 | `npm_cache_max_gb` | `1` |
 | `uv_cache_max_gb` | `1` |
+| `sccache_max_gb` | `2` — above this, sccache entries unused for a week go (sccache itself evicts only at 10 GB) |
+| `shader_cache_max_gb` | `1` (macOS) — Metal shader caches the system keeps per application in `DARWIN_USER_CACHE_DIR`; above this for one application, and when it compiled nothing for a day, they go and are rebuilt on the next launch. Apple's own folders are never touched. |
 | `brew_prune_days` | `7` |
 | `xcode_derived_days` | `14` |
 | `vscode_shipit` | `true` — VS Code update leftovers (macOS) |
