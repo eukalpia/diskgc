@@ -244,13 +244,15 @@ impl History {
         }
     }
 
-    /// Command lines that ran within the last `days` days and freed nothing. Running them again
-    /// would only cost time (and, as with `uv cache clean`, may block on another process's lock).
-    pub fn fruitless_commands(&self, days: i64) -> std::collections::HashSet<String> {
+    /// Command lines that ran within the last `days` days and freed nothing, with the largest size
+    /// the target had at such a run. Running them again would only cost time (and, as with
+    /// `uv cache clean`, may block on another process's lock) — unless the target has grown since:
+    /// a cache refilled by concurrent builds while it was cleared also reads as "freed nothing".
+    pub fn fruitless_commands(&self, days: i64) -> std::collections::HashMap<String, u64> {
         let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        let mut out = std::collections::HashSet::new();
+        let mut out = std::collections::HashMap::<String, u64>::new();
         for r in self.load() {
             if let Record::Run {
                 ts,
@@ -264,7 +266,8 @@ impl History {
                 }
                 for a in top {
                     if let (Some(cmd), Some(0)) = (a.command, a.freed) {
-                        out.insert(cmd);
+                        let size = out.entry(cmd).or_insert(0);
+                        *size = (*size).max(a.bytes);
                     }
                 }
             }
@@ -345,7 +348,7 @@ mod tests {
         };
         h.record_run(&s, vec![rec()]).unwrap();
         h.record_run(&s, vec![rec()]).unwrap();
-        assert!(h.fruitless_commands(7).contains("go clean -cache"));
+        assert_eq!(h.fruitless_commands(7).get("go clean -cache"), Some(&40));
         let st = h.stats();
         assert_eq!(st.runs, 2);
         assert_eq!(st.total_freed, 80);

@@ -152,7 +152,9 @@ impl Engine {
                         .results
                         .iter()
                         .find(|r| r.id == a.id)
-                        .map(|r| r.freed)
+                        // A failed action freed an unknown amount: don't let it read as
+                        // "freed nothing" and put its command on cooldown.
+                        .and_then(|r| r.ok.then_some(r.freed))
                 },
                 command: match &a.kind {
                     ActionKind::Command { argv, .. } => Some(argv.join(" ")),

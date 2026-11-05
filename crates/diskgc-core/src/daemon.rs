@@ -231,6 +231,19 @@ impl Daemon {
                             );
                         }
                     }
+                    for r in summary.results.iter().filter(|r| !r.ok) {
+                        if let Some(a) = plan.actions.iter().find(|a| a.id == r.id) {
+                            self.log(
+                                "warn",
+                                format!(
+                                    "action failed: {} {}: {}",
+                                    a.kind.verb(),
+                                    a.path.display(),
+                                    r.error.as_deref().unwrap_or("unknown error")
+                                ),
+                            );
+                        }
+                    }
                     let freed = summary.freed_bytes + summary.docker_freed_bytes;
                     self.log(
                         "info",

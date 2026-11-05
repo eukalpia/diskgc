@@ -25,8 +25,20 @@ mod scratch;
 /// Knowledge from previous runs that shapes the next plan.
 #[derive(Debug, Clone, Default)]
 pub struct PlanHints {
-    /// Command lines that freed nothing recently; skipped for now.
-    pub skip_commands: std::collections::HashSet<String>,
+    /// Command lines that freed nothing recently, with the target's size at that run; skipped
+    /// for now unless the target has grown well past that size (see [`PlanHints::should_skip`]).
+    pub skip_commands: std::collections::HashMap<String, u64>,
+}
+
+impl PlanHints {
+    /// Skip `line` when it recently freed nothing and its target (now `bytes`) has not grown by
+    /// more than a quarter (at least 1 GiB) since. A cache that keeps growing is retried at once:
+    /// "freed nothing" then usually means builds refilled it while it was being cleared.
+    pub fn should_skip(&self, line: &str, bytes: u64) -> Option<u64> {
+        let &was = self.skip_commands.get(line)?;
+        let slack = (was / 4).max(1 << 30);
+        (bytes <= was.saturating_add(slack)).then_some(was)
+    }
 }
 
 pub struct Ctx<'a> {
@@ -252,4 +264,27 @@ pub fn build_plan(
     timed(&mut plan, "docker", t);
     plan.sort_by_size();
     plan
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::PlanHints;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn fruitless_command_is_retried_once_its_target_grows() {
+        let mut h = PlanHints::default();
+        h.skip_commands.insert("go clean -cache".into(), 7 * GIB);
+        // Same size, or a little bigger: still on cooldown.
+        assert_eq!(h.should_skip("go clean -cache", 7 * GIB), Some(7 * GIB));
+        assert!(h.should_skip("go clean -cache", 8 * GIB).is_some());
+        // Refilled well past the size it had (the 2026-11-04 case: 7 GB -> 69 GB): run it.
+        assert_eq!(h.should_skip("go clean -cache", 20 * GIB), None);
+        // Small targets get at least 1 GiB of slack.
+        h.skip_commands.insert("uv cache clean".into(), 100 << 20);
+        assert!(h.should_skip("uv cache clean", GIB).is_some());
+        assert_eq!(h.should_skip("uv cache clean", 2 * GIB), None);
+        assert_eq!(h.should_skip("brew cleanup", 50 * GIB), None);
+    }
 }

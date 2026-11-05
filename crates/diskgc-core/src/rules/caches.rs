@@ -24,9 +24,11 @@ fn command(
     reason: impl Into<String>,
 ) {
     let line = argv.join(" ");
-    if ctx.hints.skip_commands.contains(&line) {
+    if let Some(was) = ctx.hints.should_skip(&line, bytes) {
         plan.note(format!(
-            "skipped `{line}`: it freed nothing last time (retried after 7 days)"
+            "skipped `{line}`: it freed nothing last time at {} (retried after 7 days, \
+             or sooner if the target grows)",
+            human(was)
         ));
         return;
     }
