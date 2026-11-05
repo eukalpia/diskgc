@@ -118,11 +118,13 @@ fn run() -> Result<()> {
         Cmd::Plan { level } => {
             let level = level.unwrap_or_else(|| engine.auto_level());
             let plan = engine.plan(level, |p| progress_line(&p, json));
+            clear_progress(json);
             output::plan(&plan, json);
         }
         Cmd::Clean { dry_run, level } => {
             let level = level.unwrap_or_else(|| engine.auto_level());
             let (plan, summary) = engine.clean(level, dry_run, |p| progress_line(&p, json));
+            clear_progress(json);
             output::run(&plan, &summary, json);
         }
         Cmd::Daemon => daemon(engine)?,
@@ -196,6 +198,14 @@ fn run() -> Result<()> {
         Cmd::Ui => launch_ui()?,
     }
     Ok(())
+}
+
+/// Erase the "scanning …" line before printing results: planning alone never reports
+/// `Planned`, so without this the last rule's name stayed in front of the output.
+fn clear_progress(json: bool) {
+    if !json {
+        eprint!("\r{:40}\r", "");
+    }
 }
 
 fn progress_line(p: &Progress, json: bool) {

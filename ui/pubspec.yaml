@@ -10,7 +10,7 @@ dependencies:
   cinder:
     git:
       url: https://github.com/eukalpia/cinder.git
-      ref: 86550d1
+      ref: 687396b5cd44874d39cc41fea63f2483190a3ac8
 
 dev_dependencies:
   lints: ^6.0.0

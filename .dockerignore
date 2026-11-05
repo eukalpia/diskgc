@@ -1,0 +1,5 @@
+target
+ui/build
+ui/.dart_tool
+docs/assets
+.git

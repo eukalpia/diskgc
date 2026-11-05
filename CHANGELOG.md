@@ -31,6 +31,13 @@ Found on a machine where agents kept a dozen git worktrees, each with its own `t
   1 s of the pool being busy and the walk silently ended early: sizes came out short or zero
   (a cleared cache read as "freed nothing") and recent files could go unseen, so a target being
   built could look idle.
+- `plan` and `clean` erase the "scanning …" progress line before printing; the last rule's
+  name used to stay in front of the output.
+- The dashboard's tables line up: Cinder (pinned to 687396b) insets row cells like the bordered
+  header cells, so values sit under their labels and adjacent columns no longer run together.
+- README in ten languages (English, Russian, Uzbek, Chinese, Spanish, Hindi, Arabic, French,
+  Portuguese, Japanese) with an animated banner and recordings of the dashboard and the CLI,
+  reproducible from a synthetic home directory (`docs/demo`).
 - A failed action is recorded as "freed: unknown", not "freed nothing", so it cannot put its
   command on cooldown; the daemon logs every failed action with its error.
 - The per-user `$TMPDIR` on macOS (`/var/folders/…/T`) is cleaned: entries untouched for
