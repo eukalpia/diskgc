@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0 — 2026-11-06
 
 Found on a machine where agents kept a dozen git worktrees, each with its own `target/`.
 
@@ -27,6 +27,10 @@ Found on a machine where agents kept a dozen git worktrees, each with its own `t
   growing: it runs again once the target is a quarter (at least 1 GiB) bigger than it was. A Go
   build cache cleared while agents were building read as "freed nothing", sat out the week, and
   grew from 7 GB to 69 GB in a day.
+- Directory walks run on a thread pool of their own. On rayon's global pool jwalk gives up after
+  1 s of the pool being busy and the walk silently ended early: sizes came out short or zero
+  (a cleared cache read as "freed nothing") and recent files could go unseen, so a target being
+  built could look idle.
 - A failed action is recorded as "freed: unknown", not "freed nothing", so it cannot put its
   command on cooldown; the daemon logs every failed action with its error.
 - The per-user `$TMPDIR` on macOS (`/var/folders/…/T`) is cleaned: entries untouched for
@@ -68,5 +72,5 @@ First version structured for other people's machines.
 
 ## 0.1.0 — 2026-09-05
 
-Single-file prototype (kept in `legacy/`): report, clean, daemon, stats, mem,
+Single-file prototype: report, clean, daemon, stats, mem,
 launchd install. Freed 191 GB on the machine it was written on.

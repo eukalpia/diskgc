@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, ui: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, ui: false }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ui: true }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ui: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p diskgc
+
+      # The dashboard is compiled natively; dart cannot cross-compile to Intel macOS.
+      - if: matrix.ui
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - if: matrix.ui
+        working-directory: ui
+        shell: bash
+        run: |
+          dart pub get
+          mkdir -p build
+          dart compile exe bin/diskgc_ui.dart -o "build/diskgc-ui${{ runner.os == 'Windows' && '.exe' || '' }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          name="diskgc-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          cp "target/${{ matrix.target }}/release/diskgc$ext" "dist/$name/"
+          if [ -f "ui/build/diskgc-ui$ext" ]; then cp "ui/build/diskgc-ui$ext" "dist/$name/"; fi
+          cp README.md LICENSE CHANGELOG.md "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            tar czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## / { if (found) exit; if (index($0, "## " v) == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "diskgc $GITHUB_REF_NAME" --notes-file notes.md --verify-tag

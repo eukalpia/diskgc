@@ -1,5 +1,8 @@
 # diskgc
 
+[![CI](https://github.com/eukalpia/diskgc/actions/workflows/ci.yml/badge.svg)](https://github.com/eukalpia/diskgc/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 **A background disk cleaner for developer machines that knows what it is deleting.**
 
 Developer disks fill up with things nobody asked to keep: Cargo `target/`
@@ -43,7 +46,7 @@ Estimated: 112.9 GB in 1011 actions
 | Rust targets | `target/` directories (found by content, wherever they are) | artifacts untouched for 7 days; above 20 GB also incremental caches and fat test binaries; above 40 GB everything older than a day |
 | node_modules | `node_modules` next to a `package.json` | nothing in the project changed for 30 days |
 | Build directories | `.dart_tool`, `build`, `_build`, `.next`, `.turbo`, `__pycache__`, `.gradle`, ... next to a project marker | same 30-day rule |
-| Temporary directories | Claude Code per-session scratch, your own entries in the system temp dir | silent for 3 / 7 days |
+| Temporary directories | Claude Code per-session scratch, your own entries in the system temp dir, stale work directories in the per-user `$TMPDIR` (macOS) | silent for 3 days / 7 days / 24 h |
 | AI tools | old Codex application versions, abandoned runtime installs | always (keeps current + 1) |
 | Docker | orphaned testcontainers, stopped containers, dangling volumes and images, build cache | 2 h / 24 h / 7 d |
 | Tool caches | Chrome update clones, VS Code update leftovers, Go / npm / uv caches over a cap, Homebrew downloads, Xcode DerivedData, simulator caches | per-rule caps |
@@ -73,17 +76,43 @@ rather than the symptom.
 
 ## Install
 
+Prebuilt binaries for macOS (Apple Silicon, Intel), Linux (x86_64) and Windows
+(x86_64) are attached to every [release](https://github.com/eukalpia/diskgc/releases):
+unpack `diskgc` (and optionally `diskgc-ui`) somewhere on your `PATH`.
+
+Or build from source (Rust 1.80+):
+
 ```sh
-cargo install --path crates/diskgc      # or download a release binary
-diskgc install                          # register the daemon (launchd / systemd --user / Task Scheduler)
+cargo install --locked --git https://github.com/eukalpia/diskgc diskgc
+```
+
+Then look before you let it act:
+
+```sh
+diskgc config --edit      # set [scan] roots to where your projects live
+diskgc plan               # what a clean would remove, and why — nothing is touched
+diskgc install            # start the daemon at login (launchd / systemd --user / Task Scheduler)
 diskgc status
 ```
 
-Then edit the scan roots to match where your projects live:
+## Safety
 
-```sh
-diskgc config --edit
-```
+diskgc deletes files — that is its job — so it is built to be predictable:
+
+- It only proposes things that a tool can regenerate (build output, dependency
+  directories, caches, temp files) and gives the reason for each one; `plan` and
+  `clean -n` show exactly that list without touching anything.
+- Sources, `.git`, databases and chat histories are never candidates; anything
+  matching `[scan] exclude` is never touched; the executor refuses any path
+  outside `[safety] allowed_prefixes` (by default your home directory and the
+  system temp and cache folders).
+- `[safety] delete_mode = "trash"` moves things to the trash instead of deleting
+  them permanently (when the trash is on another volume it falls back to deletion).
+- Every run is logged (`diskgc history`), with what was planned and what was
+  actually freed.
+
+It still runs unattended with your permissions, so read the first `plan` on your
+machine before installing the daemon. Bug reports with the `plan` output are welcome.
 
 ## Commands
 
@@ -143,8 +172,13 @@ delete_mode = "permanent"            # or "trash"
 
 ## Platforms
 
-macOS, Linux and Windows. Transparent compression is available on APFS and
-NTFS; autostart uses launchd, `systemd --user` and Task Scheduler respectively.
+| Platform | Status |
+|----------|--------|
+| macOS (APFS) | used daily; the main target |
+| Linux | tested in CI and in containers; `systemd --user` autostart |
+| Windows | builds and passes tests in CI; autostart via Task Scheduler is the least exercised part — reports welcome |
+
+Transparent compression is available on APFS and NTFS.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the platform matrix and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) for the IPC API the dashboard uses.
 
@@ -161,6 +195,12 @@ cp build/diskgc-ui ~/.local/bin/                            # next to diskgc
 side has unit tests per module, rule tests against synthetic project trees and
 an IPC round-trip test (`cargo test`).
 
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+A new rule needs a test against a synthetic directory tree (`crates/diskgc-core/tests/rules.rs`)
+showing both what it removes and what it must leave alone.
+
 ## License
 
-Apache-2.0.
+[Apache-2.0](LICENSE).

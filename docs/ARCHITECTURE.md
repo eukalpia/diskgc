@@ -101,5 +101,4 @@ crates/diskgc-core/   library
 crates/diskgc/        binary (CLI, daemon, IPC server)
 ui/                   Dart + Cinder client
 docs/                 ARCHITECTURE.md, PROTOCOL.md
-legacy/               the original single-file prototype, kept for reference
 ```

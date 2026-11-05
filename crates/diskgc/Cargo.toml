@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["disk", "cleanup", "cargo", "node-modules", "daemon"]
+categories = ["command-line-utilities", "filesystem", "development-tools"]
 authors.workspace = true
 rust-version.workspace = true
 
