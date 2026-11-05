@@ -23,6 +23,16 @@ Found on a machine where agents kept a dozen git worktrees, each with its own `t
   a watchdog reports any step still running after 5 minutes. A run that stalled for hours used to
   leave nothing in the log. `clean -n` prints the planning time.
 - `report` gains `sccache` and `system_app_caches` categories.
+- A command that "freed nothing" no longer stays on its 7-day cooldown while its target keeps
+  growing: it runs again once the target is a quarter (at least 1 GiB) bigger than it was. A Go
+  build cache cleared while agents were building read as "freed nothing", sat out the week, and
+  grew from 7 GB to 69 GB in a day.
+- A failed action is recorded as "freed: unknown", not "freed nothing", so it cannot put its
+  command on cooldown; the daemon logs every failed action with its error.
+- The per-user `$TMPDIR` on macOS (`/var/folders/…/T`) is cleaned: entries untouched for
+  `[scratch] user_tmp_stale_hours` (24) go, system folders (`com.apple.*`, `TemporaryItems`,
+  `TemporaryDirectory.*`) stay. Go work directories, SSR bundles and Playwright profiles had grown
+  it from 6 GB to 16 GB in a day. `report` shows it as `user_tmp`.
 
 ## 0.2.0
 

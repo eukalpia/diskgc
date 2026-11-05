@@ -119,6 +119,9 @@ pub struct Scratch {
     pub claude_stale_days: u64,
     /// Your own entries in the system temp directory: removed when untouched this long.
     pub tmp_stale_days: u64,
+    /// Entries in the per-user `$TMPDIR` (macOS): removed when untouched this long. Builds
+    /// (`go test`, Next/Vite SSR bundles, Playwright profiles) leave gigabytes there a day.
+    pub user_tmp_stale_hours: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,6 +283,7 @@ impl Default for Scratch {
         Self {
             claude_stale_days: 3,
             tmp_stale_days: 7,
+            user_tmp_stale_hours: 24,
         }
     }
 }
@@ -353,6 +357,7 @@ pub struct Effective {
     pub build_stale_days: u64,
     pub claude_scratch_days: u64,
     pub tmp_stale_days: u64,
+    pub user_tmp_stale_hours: u64,
     pub docker_stopped_hours: u64,
     pub testcontainers_hours: u64,
     /// Build cache unused for this long is pruned; `0` = all unused build cache.
@@ -443,6 +448,7 @@ impl Config {
             build_stale_days: shrink(self.build_dirs.stale_days, div),
             claude_scratch_days: shrink(self.scratch.claude_stale_days, div),
             tmp_stale_days: shrink(self.scratch.tmp_stale_days, div),
+            user_tmp_stale_hours: shrink(self.scratch.user_tmp_stale_hours, div),
             docker_stopped_hours: shrink(self.docker.stopped_hours, div),
             testcontainers_hours: shrink(self.docker.testcontainers_max_hours, div),
             docker_build_cache_hours: if level == Level::Critical {

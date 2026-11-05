@@ -100,6 +100,11 @@ pub fn chrome_clone_dir() -> Option<PathBuf> {
     x.is_dir().then_some(x)
 }
 
+/// `$TMPDIR` itself (`DARWIN_USER_TEMP_DIR`).
+pub fn user_tmp_dir() -> Option<PathBuf> {
+    darwin_user_dir("T").filter(|t| t.is_dir())
+}
+
 /// The sibling `C` (`DARWIN_USER_CACHE_DIR`).
 pub fn user_cache_dir() -> Option<PathBuf> {
     darwin_user_dir("C").filter(|c| c.is_dir())

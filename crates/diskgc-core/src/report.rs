@@ -98,6 +98,9 @@ pub fn collect(cfg: &Config, mut on_step: impl FnMut(&str)) -> Report {
         .map(|p| disk_usage(&p))
         .sum();
     categories.insert("tmp_other".into(), tmp_other);
+    if let Some(utmp) = platform::user_tmp_dir() {
+        categories.insert("user_tmp".into(), disk_usage(&utmp));
+    }
     on_step("AI tools");
     categories.insert(
         "codex".into(),

@@ -79,6 +79,7 @@ A directory is a candidate only when a project marker (`Cargo.toml`,
 |-----|---------|
 | `claude_stale_days` | `3` — Claude Code per-session scratch directories |
 | `tmp_stale_days` | `7` — your own entries in the system temp directory |
+| `user_tmp_stale_hours` | `24` — entries of the per-user `$TMPDIR` (macOS `/var/folders/…/T`; `com.apple.*`, `TemporaryItems`, `TemporaryDirectory.*` are kept) |
 
 ## `[ai_tools]`
 

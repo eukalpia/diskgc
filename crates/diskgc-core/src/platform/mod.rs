@@ -88,6 +88,12 @@ pub fn system_tmp_dir() -> PathBuf {
     os::system_tmp_dir()
 }
 
+/// The per-user temp directory the system manages besides the shared one (`$TMPDIR`, i.e.
+/// `/var/folders/…/T`, on macOS), where build tools leave work directories. `None` elsewhere.
+pub fn user_tmp_dir() -> Option<PathBuf> {
+    os::user_tmp_dir()
+}
+
 /// Where Claude Code keeps per-session scratch directories for the current user.
 pub fn claude_scratch_root() -> Option<PathBuf> {
     os::claude_scratch_root()

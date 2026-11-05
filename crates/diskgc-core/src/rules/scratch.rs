@@ -1,8 +1,8 @@
-//! Temporary directories: per-session scratch space of Claude Code and the user's own entries in
-//! the system temp directory.
+//! Temporary directories: per-session scratch space of Claude Code, the user's own entries in
+//! the system temp directory, and stale work directories in the per-user `$TMPDIR` (macOS).
 
 use super::{Ctx, Rule};
-use crate::fs::{self, days, file_name};
+use crate::fs::{self, days, file_name, hours};
 use crate::model::{ActionKind, Group, Plan};
 use crate::platform;
 
@@ -72,6 +72,68 @@ impl Rule for Scratch {
                     );
                 }
             }
+        }
+        if let Some(utmp) = platform::user_tmp_dir() {
+            let stale = ctx.eff.user_tmp_stale_hours;
+            for e in std::fs::read_dir(&utmp).into_iter().flatten().flatten() {
+                let p = e.path();
+                if !is_user_tmp_candidate(&file_name(&p)) || ctx.excluded(&p) {
+                    continue;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                if !platform::owned_by_current_user(&meta) {
+                    continue;
+                }
+                if fs::idle_for(&p, hours(stale), &[]) {
+                    let b = fs::disk_usage(&p);
+                    if b > 0 {
+                        plan.push(
+                            Group::Tmp,
+                            ActionKind::Remove,
+                            p,
+                            b,
+                            format!("in $TMPDIR, unchanged for {stale} h"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Entries of `$TMPDIR` that are ours to clear: not hidden, and not the per-daemon folders the
+/// system and apps keep there (`com.apple.*`, `TemporaryItems`, `TemporaryDirectory.*`).
+fn is_user_tmp_candidate(name: &str) -> bool {
+    !(name.starts_with('.')
+        || name.starts_with("com.apple.")
+        || name.starts_with("TemporaryDirectory.")
+        || name == "TemporaryItems"
+        || !name.contains(|c: char| c.is_ascii_alphanumeric()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_user_tmp_candidate;
+
+    #[test]
+    fn user_tmp_skips_system_entries() {
+        for ok in [
+            "go-build2876470175",
+            "remotion-webpack-bundle-abc",
+            "playwright_chromiumdev_profile-x",
+            "sWClxugmGJ9TkW8B_zIlx",
+        ] {
+            assert!(is_user_tmp_candidate(ok), "{ok}");
+        }
+        for no in [
+            ".X11-unix",
+            "com.apple.replayd",
+            "TemporaryItems",
+            "TemporaryDirectory.Ab12Cd",
+        ] {
+            assert!(!is_user_tmp_candidate(no), "{no}");
         }
     }
 }

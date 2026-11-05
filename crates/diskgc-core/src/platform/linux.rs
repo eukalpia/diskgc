@@ -48,6 +48,10 @@ pub fn user_cache_dir() -> Option<PathBuf> {
     None
 }
 
+pub fn user_tmp_dir() -> Option<PathBuf> {
+    None
+}
+
 pub fn notify(title: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
         .arg(title)
