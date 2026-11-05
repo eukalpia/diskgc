@@ -23,10 +23,35 @@ pub fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The thread pool directory walks run on. jwalk's default is rayon's global pool with a 1 s
+/// "busy" timeout, after which the walk silently ends early: with the global pool occupied (by
+/// other walks, or by anything else using rayon) sizes came out short or zero and recent files
+/// went unseen — so a target being built could look idle. A pool of our own, with no busy
+/// timeout, makes concurrent walks queue instead. Walks never start from inside this pool (the
+/// visitor runs on the calling thread), so they cannot deadlock on it.
+fn walk_pool() -> std::sync::Arc<jwalk::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<std::sync::Arc<jwalk::rayon::ThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8);
+        std::sync::Arc::new(
+            jwalk::rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("diskgc-walk-{i}"))
+                .build()
+                .expect("cannot start the directory walk thread pool"),
+        )
+    })
+    .clone()
+}
+
 /// Every entry below `root` with its metadata: hard links once, symbolic links not followed,
 /// macOS-protected locations skipped. Directories are read and their entries stat'ed in parallel
-/// (jwalk + rayon); `f` runs on the calling thread. `root` itself is only reported when it is not
-/// a directory.
+/// (jwalk on [`walk_pool`]); `f` runs on the calling thread. `root` itself is only reported when
+/// it is not a directory.
 pub fn visit(root: &Path, mut f: impl FnMut(&Path, &std::fs::Metadata)) {
     match std::fs::symlink_metadata(root) {
         Ok(m) if !m.is_dir() => return f(root, &m),
@@ -36,6 +61,10 @@ pub fn visit(root: &Path, mut f: impl FnMut(&Path, &std::fs::Metadata)) {
     let walker = jwalk::WalkDirGeneric::<((), Option<std::fs::Metadata>)>::new(root)
         .skip_hidden(false)
         .follow_links(false)
+        .parallelism(jwalk::Parallelism::RayonExistingPool {
+            pool: walk_pool(),
+            busy_timeout: None,
+        })
         .process_read_dir(|_depth, _path, _state, children| {
             children.retain(|c| {
                 c.as_ref()
@@ -328,6 +357,39 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|p| p.ends_with("a/target")));
         assert!(found.iter().any(|p| p.ends_with("b/odd-name")));
+    }
+
+    #[test]
+    fn walks_are_complete_while_the_global_rayon_pool_is_busy() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            let sub = d.path().join(format!("d{i}"));
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("f"), vec![1u8; 10_000]).unwrap();
+        }
+        let expected = disk_usage(d.path());
+        let files = || {
+            let mut n = 0;
+            visit(d.path(), |_, m| n += m.is_file() as usize);
+            n
+        };
+        assert_eq!(files(), 50);
+        // Occupy every thread of rayon's global pool for longer than jwalk's default 1 s busy
+        // timeout; a walk on that pool would end early and report less.
+        let threads = jwalk::rayon::current_num_threads();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        for _ in 0..threads {
+            let started_tx = started_tx.clone();
+            jwalk::rayon::spawn(move || {
+                started_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2_500));
+            });
+        }
+        for _ in 0..threads {
+            started_rx.recv().unwrap();
+        }
+        assert_eq!(files(), 50);
+        assert_eq!(disk_usage(d.path()), expected);
     }
 
     #[test]
