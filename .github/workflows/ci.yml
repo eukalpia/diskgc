@@ -48,5 +48,5 @@ jobs:
         working-directory: ui
       - run: dart test
         working-directory: ui
-      - run: dart compile exe bin/diskgc_ui.dart -o build/diskgc-ui
+      - run: mkdir -p build && dart compile exe bin/diskgc_ui.dart -o build/diskgc-ui
         working-directory: ui
